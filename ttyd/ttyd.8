@@ -1,0 +1,32 @@
+.TH TTYD 8 "June 18, 1999"
+.SH NAME
+ttyd \- terminal history helper daemon
+.SH SYNOPSIS
+.B ttyd
+.SH DESCRIPTION
+The
+.B ttyd
+daemon maintains a history of lines typed on terminals that
+have the
+.SM L_HISTORY
+flag set.
+.LP
+It repeatedly uses the
+.SM TIOCHELPER
+ioctl on the console device to
+indicate that it is ready to accept requests from the kernel.
+These requests cause new lines to be stored on the history list
+belonging to a particular process and terminal
+or for old lines from the history to be recalled.
+.SH SEE ALSO
+.BR termios (4)
+.SH FILES
+.TP 2.5i
+/dev/console, /dev/tty*
+Terminal device files
+.SH BUGS
+There is no protection against running multiple instances of
+.B ttyd
+simultaneously, which will interfere with each other.
+.SH AUTHOR
+Eric Fischer <enf@pobox.com>
