@@ -1,0 +1,60 @@
+diff -rc ../../../src/bin/stty/key.c bin/stty/key.c
+*** ../../../src/bin/stty/key.c	Thu Sep  7 01:57:11 1995
+--- bin/stty/key.c	Fri Jul 24 22:51:30 1998
+***************
+*** 272,278 ****
+  	ip->t.c_iflag = TTYDEF_IFLAG;
+  	ip->t.c_iflag |= ICRNL;
+  	/* preserve user-preference flags in lflag */
+! #define	LKEEP	(ECHOKE|ECHOE|ECHOK|ECHOPRT|ECHOCTL|ALTWERASE|TOSTOP|NOFLSH)
+  	ip->t.c_lflag = TTYDEF_LFLAG | (ip->t.c_lflag & LKEEP);
+  	ip->t.c_oflag = TTYDEF_OFLAG;
+  	ip->set = 1;
+--- 272,279 ----
+  	ip->t.c_iflag = TTYDEF_IFLAG;
+  	ip->t.c_iflag |= ICRNL;
+  	/* preserve user-preference flags in lflag */
+! #define	LKEEP	(ECHOKE|ECHOE|ECHOK|ECHOPRT|ECHOCTL|ALTWERASE|TOSTOP|NOFLSH| \
+! 		 L_HISTORY|L_SETERASE|L_EMACS)
+  	ip->t.c_lflag = TTYDEF_LFLAG | (ip->t.c_lflag & LKEEP);
+  	ip->t.c_oflag = TTYDEF_OFLAG;
+  	ip->set = 1;
+Only in bin/stty: key.o
+diff -rc ../../../src/bin/stty/modes.c bin/stty/modes.c
+*** ../../../src/bin/stty/modes.c	Tue May  7 13:20:09 1996
+--- bin/stty/modes.c	Fri Jul 24 22:18:12 1998
+***************
+*** 175,180 ****
+--- 175,186 ----
+  	{ "-nokerninfo",0, NOKERNINFO },
+  	{ "kerninfo",	0, NOKERNINFO },
+  	{ "-kerninfo",	NOKERNINFO, 0 },
++ 	{ "emacs",	L_EMACS, 0 },
++ 	{ "-emacs",	0, L_EMACS },
++ 	{ "history",	L_HISTORY, 0 },
++ 	{ "-history",	0, L_HISTORY },
++ 	{ "seterase",	L_SETERASE, 0 },
++ 	{ "-seterase",	0, L_SETERASE },
+  	{ NULL },
+  };
+  
+Only in bin/stty: modes.o
+diff -rc ../../../src/bin/stty/print.c bin/stty/print.c
+*** ../../../src/bin/stty/print.c	Tue May  7 13:20:10 1996
+--- bin/stty/print.c	Fri Jul 24 22:21:15 1998
+***************
+*** 125,130 ****
+--- 125,133 ----
+  	put("-pendin", PENDIN, 0);
+  	put("-nokerninfo", NOKERNINFO, 0);
+  	put("-extproc", EXTPROC, 0);
++ 	put("-emacs", L_EMACS, 0);
++ 	put("-history", L_HISTORY, 0);
++ 	put("-seterase", L_SETERASE, 0);
+  
+  	/* input flags */
+  	tmp = tp->c_iflag;
+Only in bin/stty: print.o
+Only in bin/stty: stty
+Only in bin/stty: stty.cat1
+Only in bin/stty: stty.o

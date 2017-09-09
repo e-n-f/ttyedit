@@ -1,0 +1,33 @@
+<html>
+<head>
+<title>TTY editing patches</title>
+</head>
+<body>
+<h1>TTY editing patches</h1>
+This web page contains links to the software described in
+my paper from the <a href="http://www.usenix.org/events/usenix99/">1999
+Usenix Annual Technical Conference</a>,
+``New Tricks for an Old Terminal Driver.''
+The paper appears in the proceedings
+(<i>Proceedings of the Freenix Track: 1999 Usenix Annual
+Technical Conference</i>, Monterey, CA, June 6-11, 1999, pp. 219-221)
+or you can read it here in either
+<a href="usenix99.ps">PostScript</a>
+or
+<a href="usenix99.html">HTML format</a>.
+<p>
+The patches are:
+<ul>
+<li>The <a href="kernel">kernel patch</a> itself
+<li>A <a href="stty">patch to stty</a> so it can turn
+the new features on and off
+<li>A <a href="mail">patch to mail</a> that takes advantage
+of one of the new ioctls
+<li>The source for <a href="ttyd.tar">the daemon</a> that
+maintains history lists
+</ul>
+<p>
+These are still evolving,
+so if you are thinking of including them in your operating system
+please
+<a href="mailto:enf@pobox.com">contact me</a> before you do.

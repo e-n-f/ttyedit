@@ -1,0 +1,1036 @@
+diff -rc ../../../src/sys/arch/amiga/dev/msc.c sys/arch/amiga/dev/msc.c
+*** ../../../src/sys/arch/amiga/dev/msc.c	Wed Jun  5 23:53:17 1996
+--- sys/arch/amiga/dev/msc.c	Sun Jul 26 10:26:47 1998
+***************
+*** 331,339 ****
+--- 331,341 ----
+        /* default values are not optimal for this device, increase buffers. */
+        clfree(&tp->t_rawq);
+        clfree(&tp->t_canq);
++       clfree(&tp->t_edq);
+        clfree(&tp->t_outq);
+        clalloc(&tp->t_rawq, 8192, 1);
+        clalloc(&tp->t_canq, 8192, 1);
++       clalloc(&tp->t_edq, 8192, 1);
+        clalloc(&tp->t_outq, 8192, 0);
+  #endif
+  
+diff -rc ../../../src/sys/arch/pmax/dev/rcons.c sys/arch/pmax/dev/rcons.c
+*** ../../../src/sys/arch/pmax/dev/rcons.c	Sat May 18 20:06:14 1996
+--- sys/arch/pmax/dev/rcons.c	Sun Jul 26 10:27:17 1998
+***************
+*** 216,221 ****
+--- 216,222 ----
+  	/* Set up the tty queues now... */
+  	clalloc(&tp->t_rawq, 1024, 1);
+  	clalloc(&tp->t_canq, 1024, 1);
++ 	clalloc(&tp->t_edq, 1024, 1);
+  	/* output queue doesn't need quoting */
+  	clalloc(&tp->t_outq, 1024, 0);
+  #ifdef DEBUG
+Only in sys/arch/sparc/compile: GENERIC
+diff -rc ../../../src/sys/arch/sparc/dev/cons.c sys/arch/sparc/dev/cons.c
+*** ../../../src/sys/arch/sparc/dev/cons.c	Sun Jun  2 04:07:53 1996
+--- sys/arch/sparc/dev/cons.c	Sun Jul 26 10:27:46 1998
+***************
+*** 282,287 ****
+--- 282,288 ----
+  	if (firstopen) {
+  		clalloc(&tp->t_rawq, 1024, 1);
+  		clalloc(&tp->t_canq, 1024, 1);
++ 		clalloc(&tp->t_edq, 1024, 1);
+  		/* output queue doesn't need quoting */
+  		clalloc(&tp->t_outq, 1024, 0);
+  		tty_attach(tp);
+diff -rc ../../../src/sys/kern/tty.c sys/kern/tty.c
+*** ../../../src/sys/kern/tty.c	Thu Jun  6 11:04:52 1996
+--- sys/kern/tty.c	Wed Jun 16 22:18:07 1999
+***************
+*** 64,70 ****
+--- 64,79 ----
+  static void ttyblock __P((struct tty *));
+  static void ttyecho __P((int, struct tty *));
+  static void ttyrubo __P((struct tty *, int));
++ static void ttybacko __P((struct tty *, int));
+  static int proc_compare __P((struct proc *, struct proc *));
++ static int ttyfwd __P((struct tty *));
++ static int ttyback __P((struct tty *));
++ static void ttyrub __P((int, struct tty *, void (*)(struct tty *, int)));
++ static void ttyedtype __P((struct tty *, int));
++ static struct proc *ttycurproc __P((struct tty *));
++ static int tty_calc_magic __P((struct tty *));
++ static int tty_help_request __P((struct tty *, int, pid_t, int));
++ static int tty_emacs __P((struct tty *, int));
+  
+  /* Symbolic sleep message strings. */
+  char ttclos[]	= "ttycls";
+***************
+*** 77,82 ****
+--- 86,108 ----
+  char ttyout[]	= "ttyout";
+  
+  /*
++  * The two ERASE keys favored by the L_SETERASE flag
++  */
++ #define K_BS   CTRL('h')
++ #define K_DEL  127
++ 
++ /*
++  * and the ESC key, for emacs's Meta sequences:
++  */
++ #define K_ESC  27
++ 
++ /*
++  * the t_edflags field can have these bits set:
++  */
++ #define ES_ESC		(1 << 0)
++ #define ES_BRACKET	(1 << 1)
++ 
++ /*
+   * Table with character classes and parity. The 8th bit indicates parity,
+   * the 7th bit indicates the character is an alphameric or underscore (for
+   * ALTWERASE), and the low 6 bits indicate delay type.  If the low 6 bits
+***************
+*** 149,154 ****
+--- 175,183 ----
+  #undef	TB
+  #undef	VT
+  
++ /* For emacs forward/backward word commands */
++ #define ISSPACE(c) ((c) == ' ' || (c) == '\t')
++ 
+  /* Macros to clear/set/test flags. */
+  #define	SET(t, f)	(t) |= (f)
+  #define	CLR(t, f)	(t) &= ~((unsigned)(f))
+***************
+*** 158,163 ****
+--- 187,206 ----
+  int tty_count;
+  
+  /*
++  * Queue of requests to the tty helper daemon
++  */
++ struct tty_helper_list {
++ 	struct tty_helper_list	*thl_next;
++ 	struct ttyhelper	thl_helper;
++ };
++ 
++ static struct tty_helper_list *tty_helpers = NULL;
++ 
++ #define MAX_HELPER_REQUESTS 20  /* if no ttyd, don't queue forever */
++ static int n_tty_helpers = 0;
++ static int stop_queueing_helpers = 0;
++ 
++ /*
+   * Initial open of tty, or (re)entry to standard tty line discipline.
+   */
+  int
+***************
+*** 381,403 ****
+  		 * From here on down canonical mode character
+  		 * processing takes place.
+  		 */
+  		/*
+  		 * erase (^H / ^?)
+  		 */
+  		if (CCEQ(cc[VERASE], c)) {
+  			if (tp->t_rawq.c_cc)
+! 				ttyrub(unputc(&tp->t_rawq), tp);
+  			goto endcase;
+  		}
+  		/*
+  		 * kill (^U)
+  		 */
+  		if (CCEQ(cc[VKILL], c)) {
+  			if (ISSET(lflag, ECHOKE) &&
+  			    tp->t_rawq.c_cc == tp->t_rocount &&
+  			    !ISSET(lflag, ECHOPRT))
+  				while (tp->t_rawq.c_cc)
+! 					ttyrub(unputc(&tp->t_rawq), tp);
+  			else {
+  				ttyecho(c, tp);
+  				if (ISSET(lflag, ECHOK) ||
+--- 424,460 ----
+  		 * From here on down canonical mode character
+  		 * processing takes place.
+  		 */
++ 
++ 		/*
++ 		 * if requested, automatically choose ^H or ^? to be
++ 		 * the ERASE character as appropriate
++ 		 */
++ 		if (ISSET(lflag, L_SETERASE) && (c == K_BS || c == K_DEL))
++ 			cc[VERASE] = c;
+  		/*
+  		 * erase (^H / ^?)
+  		 */
+  		if (CCEQ(cc[VERASE], c)) {
++ 			int here = tp->t_column;
++ 
+  			if (tp->t_rawq.c_cc)
+! 				ttyrub(unputc(&tp->t_rawq), tp, ttyrubo);
+! 			if (tp->t_edq.c_cc)
+! 				ttyedtype (tp, here - tp->t_column);
+  			goto endcase;
+  		}
+  		/*
+  		 * kill (^U)
+  		 */
+  		if (CCEQ(cc[VKILL], c)) {
++ 			while (ttyfwd (tp) >= 0)
++ 				;
++ 
+  			if (ISSET(lflag, ECHOKE) &&
+  			    tp->t_rawq.c_cc == tp->t_rocount &&
+  			    !ISSET(lflag, ECHOPRT))
+  				while (tp->t_rawq.c_cc)
+! 					ttyrub(unputc(&tp->t_rawq), tp,ttyrubo);
+  			else {
+  				ttyecho(c, tp);
+  				if (ISSET(lflag, ECHOK) ||
+***************
+*** 415,452 ****
+  		if (CCEQ(cc[VWERASE], c)) {
+  			int alt = ISSET(lflag, ALTWERASE);
+  			int ctype;
+  
+  			/*
+  			 * erase whitespace
+  			 */
+  			while ((c = unputc(&tp->t_rawq)) == ' ' || c == '\t')
+! 				ttyrub(c, tp);
+  			if (c == -1)
+! 				goto endcase;
+  			/*
+  			 * erase last char of word and remember the
+  			 * next chars type (for ALTWERASE)
+  			 */
+! 			ttyrub(c, tp);
+  			c = unputc(&tp->t_rawq);
+  			if (c == -1)
+! 				goto endcase;
+  			if (c == ' ' || c == '\t') {
+  				(void)putc(c, &tp->t_rawq);
+! 				goto endcase;
+  			}
+  			ctype = ISALPHA(c);
+  			/*
+  			 * erase rest of word
+  			 */
+  			do {
+! 				ttyrub(c, tp);
+  				c = unputc(&tp->t_rawq);
+  				if (c == -1)
+! 					goto endcase;
+  			} while (c != ' ' && c != '\t' &&
+  			    (alt == 0 || ISALPHA(c) == ctype));
+  			(void)putc(c, &tp->t_rawq);
+  			goto endcase;
+  		}
+  		/*
+--- 472,513 ----
+  		if (CCEQ(cc[VWERASE], c)) {
+  			int alt = ISSET(lflag, ALTWERASE);
+  			int ctype;
++ 			int here = tp->t_column;
+  
+  			/*
+  			 * erase whitespace
+  			 */
+  			while ((c = unputc(&tp->t_rawq)) == ' ' || c == '\t')
+! 				ttyrub(c, tp, ttyrubo);
+  			if (c == -1)
+! 				goto enderase;
+  			/*
+  			 * erase last char of word and remember the
+  			 * next chars type (for ALTWERASE)
+  			 */
+! 			ttyrub(c, tp, ttyrubo);
+  			c = unputc(&tp->t_rawq);
+  			if (c == -1)
+! 				goto enderase;
+  			if (c == ' ' || c == '\t') {
+  				(void)putc(c, &tp->t_rawq);
+! 				goto enderase;
+  			}
+  			ctype = ISALPHA(c);
+  			/*
+  			 * erase rest of word
+  			 */
+  			do {
+! 				ttyrub(c, tp, ttyrubo);
+  				c = unputc(&tp->t_rawq);
+  				if (c == -1)
+! 					goto enderase;
+  			} while (c != ' ' && c != '\t' &&
+  			    (alt == 0 || ISALPHA(c) == ctype));
+  			(void)putc(c, &tp->t_rawq);
++ enderase:
++ 			if (tp->t_edq.c_cc)
++ 				ttyedtype (tp, here - tp->t_column);
+  			goto endcase;
+  		}
+  		/*
+***************
+*** 466,471 ****
+--- 527,554 ----
+  				ttyinfo(tp);
+  			goto endcase;
+  		}
++ 		/*
++ 		 * do emacs-style editing
++ 		 */
++ 		if (ISSET (lflag, L_EMACS))
++ 			if (tty_emacs (tp, c))
++ 				goto endcase;
++ 		/*
++ 		 * If this is a newline, move to the end of the line
++ 		 * and possibly save it for the history list
++ 		 */
++ 		if (c == '\n') {
++ 			while (ttyfwd (tp) >= 0)
++ 				;
++ 
++ 			if (ISSET (lflag, L_HISTORY) && ISSET (lflag, ECHO)) {
++ 				struct proc *p;
++ 
++ 				if ((p = ttycurproc (tp)))
++ 					tty_help_request (tp, TH_HIST_KEEP,
++ 							  p->p_pid, TRUE);
++ 			}
++ 		}
+  	}
+  	/*
+  	 * Check for input buffer overflow
+***************
+*** 503,508 ****
+--- 586,593 ----
+  		}
+  		i = tp->t_column;
+  		ttyecho(c, tp);
++ 		if (tp->t_edq.c_cc)
++ 			ttyedtype (tp, 0);
+  		if (CCEQ(cc[VEOF], c) && ISSET(lflag, ECHO)) {
+  			/*
+  			 * Place the cursor over the '^' of the ^D.
+***************
+*** 617,622 ****
+--- 702,746 ----
+  }
+  
+  /*
++  * ttyfwd - move one character forward in the line
++  */
++ 
++ static int
++ ttyfwd (tp)
++ 	register struct tty *tp;
++ {
++ 	register int c;
++ 
++ 	if (tp->t_edq.c_cc < 1)
++ 		return -1;
++ 
++ 	c = unputc (&tp->t_edq);
++ 	putc (c, &tp->t_rawq);
++ 	ttyecho (c, tp);
++ 	tp->t_rocount++;
++ 	return c;
++ }
++ 
++ /*
++  * ttyback - move one character backward in the line
++  */
++ 
++ static int
++ ttyback (tp)
++ 	register struct tty *tp;
++ {
++ 	register int c;
++ 
++ 	if (tp->t_rawq.c_cc < 1)
++ 		return -1;
++ 
++ 	c = unputc (&tp->t_rawq);
++ 	putc (c, &tp->t_edq);
++ 	ttyrub (c, tp, ttybacko);
++ 	return c;
++ }
++ 
++ /*
+   * Ioctls for all tty devices.  Called after line-discipline specific ioctl
+   * has been called to do discipline-specific functions and/or reject any
+   * of these ioctl commands.
+***************
+*** 894,899 ****
+--- 1018,1199 ----
+  			pgsignal(tp->t_pgrp, SIGWINCH, 1);
+  		}
+  		break;
++ 	case TIOCGINPUT:		/* report current contents of rawq */
++ 		if (p->p_ucred->cr_uid && (flag & FREAD) == 0)
++ 			return EPERM;
++ 		else if (p->p_ucred->cr_uid && !isctty(p, tp))
++ 			return EACCES;
++ 		else {
++ 			register struct ttyinput *ti = (struct ttyinput *) data;
++ 			register u_char *str, *cp;
++ 			int n = 0, s, c;
++ 
++ 			/* don't use too much memory for temporaries */
++ 			if (ti->ti_len > LINE_MAX)
++ 				ti->ti_len = LINE_MAX;
++ 
++ 			s = spltty();
++ 			MALLOC (str, u_char *, ti->ti_len * sizeof (u_char),
++ 				M_TTYS, M_WAITOK);
++ 
++ 			for (cp = firstc (&tp->t_rawq, &c); 
++ 			     cp != NULL && n < ti->ti_len;
++ 			     cp = nextc (&tp->t_rawq, cp, &c))
++ 				str[n++] = c;
++ 
++ 			if (n > ti->ti_len)
++ 				panic ("TIOCGINPUT: can't happen");
++ 
++ 			error = copyout (str, ti->ti_text, n);
++ 
++ 			if (n == ti->ti_len) {
++ 				error = EMSGSIZE;
++ 				ti->ti_len = tp->t_rawq.c_cc;
++ 			} else
++ 				ti->ti_len = n;
++ 
++ 			ti->ti_magic = tty_calc_magic (tp);
++ 
++ 			FREE (str, M_TTYS);
++ 			splx (s);
++ 
++ 			if (error)
++ 				return error;
++ 		}
++ 		break;
++ 	case TIOCSINPUT:		/* replace current contents of rawq */
++ 		if (p->p_ucred->cr_uid && (flag & FREAD) == 0)
++ 			return EPERM;
++ 		else if (p->p_ucred->cr_uid && !isctty(p, tp))
++ 			return EACCES;
++ 		else {
++ 			register struct ttyinput *ti = (struct ttyinput *) data;
++ 			register u_char *str, *cp;
++ 			int n, c;
++ 
++ 			if (ti->ti_len > LINE_MAX)
++ 				return E2BIG;
++ 			if (ti->ti_magic != 0)
++ 				if (ti->ti_magic != tty_calc_magic (tp))
++ 					return EBUSY;
++ 
++ 			s = spltty();
++ 			MALLOC (str, u_char *, ti->ti_len * sizeof (u_char),
++ 				M_TTYS, M_WAITOK);
++ 
++ 			error = copyin (ti->ti_text, str, ti->ti_len);
++ 			if (error) {
++ 				FREE (str, M_TTYS);
++ 				splx (s);
++ 				return error;
++ 			}
++ 			
++ 			n = 0;
++ 
++ 			if (tp->t_rocount == 0 && tp->t_rawq.c_cc != 0) {
++ 				/*
++ 				 * some process has been doing output.
++ 				 * redo the whole line.
++ 				 */
++ 				FLUSHQ(&tp->t_rawq);
++ 				ttyecho(tp->t_cc[VREPRINT], tp);
++ 				ttyoutput ('\n', tp);
++ 			} else {
++ 				/*
++ 				 * otherwise, find out how much is the
++ 				 * same and backspace up to there.
++ 				 */
++ 				for (cp = firstc (&tp->t_rawq, &c); cp;
++ 				     cp = nextc (&tp->t_rawq, cp, &c))
++ 					if (n >= ti->ti_len || c != str[n])
++ 						break;
++ 					else
++ 						n++;
++ 				while (tp->t_rawq.c_cc > n)
++ 					ttyrub (unputc (&tp->t_rawq), tp,
++ 						ttyrubo);
++ 			}
++ 
++ 			for (; n < ti->ti_len; n++)
++ 				/*
++ 				 * XXX need to deal with non-echo mode
++ 				 */
++ 				if (putc (str[n], &tp->t_rawq) >= 0) {
++ 					ttyecho (str[n], tp);
++ 
++ 					if (tp->t_rocount++ == 0)
++ 						tp->t_rocol = tp->t_column;
++ 				}
++ 
++ 			FREE (str, M_TTYS);
++ 			splx (s);
++ 			ttstart (tp);
++ 		}
++ 		break;
++ 	case TIOCTOEOL:			/* move cursor to end of line */
++ 		if (p->p_ucred->cr_uid && (flag & FREAD) == 0)
++ 			return EPERM;
++ 		if (p->p_ucred->cr_uid && !isctty(p, tp))
++ 			return EACCES;
++ 
++ 		while (ttyfwd (tp) >= 0)
++ 			;
++ 
++ 		break;
++ 	case TIOCHELPER:
++ 		if (p->p_ucred->cr_uid != 0)
++ 			return EPERM;
++ 		else {
++ 			register struct ttyhelper *th = 
++ 				(struct ttyhelper *) data;
++ 			register struct tty_helper_list **thlp, *thl;
++ 
++ 			s = spltty();
++ 
++ 			while (! tty_helpers) {
++ 				splx (s);
++ 				error = ttysleep(tp, &tty_helpers,
++ 						 TTIPRI | PCATCH, "ttyioctl",
++ 						 0);
++ 				if (error)
++ 					return error;
++ 				s = spltty();
++ 			}
++ 
++ 			for (thlp = &tty_helpers; (*thlp)->thl_next;
++ 			     thlp = &((*thlp)->thl_next))
++ 				;
++ 
++ 			thl = *thlp;
++ 			th->th_request = thl->thl_helper.th_request;
++ 			th->th_pid = thl->thl_helper.th_pid;
++ 			th->th_tty = thl->thl_helper.th_tty;
++ 
++ 			if (th->th_len >= thl->thl_helper.th_len) {
++ 				th->th_len = thl->thl_helper.th_len;
++ 				error = copyout (thl->thl_helper.th_info,
++ 						 th->th_info, th->th_len);
++ 				if (error) {
++ 					splx (s);
++ 					return error;
++ 				}
++ 			} else {
++ 				return E2BIG;
++ 			}
++ 
++ 			if (thl->thl_helper.th_info)
++ 				FREE (thl->thl_helper.th_info, M_TTYS);
++ 			FREE (thl, M_TTYS);
++ 
++ 			*thlp = NULL;
++ 			if (n_tty_helpers > 0)
++ 				n_tty_helpers--;
++ 
++ 			stop_queueing_helpers = 0;
++ 			splx (s);
++ 			break;
++ 		}
++ 		break;
+  	default:
+  #ifdef COMPAT_OLDTTY
+  		return (ttcompat(tp, cmd, data, flag, p));
+***************
+*** 1634,1642 ****
+   * as cleanly as possible.
+   */
+  void
+! ttyrub(c, tp)
+  	int c;
+  	register struct tty *tp;
+  {
+  	register u_char *cp;
+  	register int savecol;
+--- 1934,1943 ----
+   * as cleanly as possible.
+   */
+  void
+! ttyrub(c, tp, fn)
+  	int c;
+  	register struct tty *tp;
++ 	void (* fn) __P((struct tty *, int));
+  {
+  	register u_char *cp;
+  	register int savecol;
+***************
+*** 1654,1665 ****
+  			return;
+  		}
+  		if (c == ('\t' | TTY_QUOTE) || c == ('\n' | TTY_QUOTE))
+! 			ttyrubo(tp, 2);
+  		else {
+  			CLR(c, ~TTY_CHARMASK);
+  			switch (CCLASS(c)) {
+  			case ORDINARY:
+! 				ttyrubo(tp, 1);
+  				break;
+  			case BACKSPACE:
+  			case CONTROL:
+--- 1955,1966 ----
+  			return;
+  		}
+  		if (c == ('\t' | TTY_QUOTE) || c == ('\n' | TTY_QUOTE))
+! 			fn(tp, 2);
+  		else {
+  			CLR(c, ~TTY_CHARMASK);
+  			switch (CCLASS(c)) {
+  			case ORDINARY:
+! 				fn(tp, 1);
+  				break;
+  			case BACKSPACE:
+  			case CONTROL:
+***************
+*** 1667,1673 ****
+  			case RETURN:
+  			case VTAB:
+  				if (ISSET(tp->t_lflag, ECHOCTL))
+! 					ttyrubo(tp, 2);
+  				break;
+  			case TAB:
+  				if (tp->t_rocount < tp->t_rawq.c_cc) {
+--- 1968,1974 ----
+  			case RETURN:
+  			case VTAB:
+  				if (ISSET(tp->t_lflag, ECHOCTL))
+! 					fn(tp, 2);
+  				break;
+  			case TAB:
+  				if (tp->t_rocount < tp->t_rawq.c_cc) {
+***************
+*** 1730,1735 ****
+--- 2031,2050 ----
+  }
+  
+  /*
++  * Back over cnt characters, not erasing them.
++  */
++ static void
++ ttybacko(tp, cnt)
++ 	register struct tty *tp;
++ 	int cnt;
++ {
++ 
++ 	while (cnt-- > 0) {
++ 		(void)ttyoutput('\b', tp);
++ 	}
++ }
++ 
++ /*
+   * ttyretype --
+   *	Reprint the rawq line.  Note, it is assumed that c_cc has already
+   *	been checked.
+***************
+*** 1757,1762 ****
+--- 2072,2121 ----
+  
+  	tp->t_rocount = tp->t_rawq.c_cc;
+  	tp->t_rocol = 0;
++ 
++ 	ttyedtype (tp, 0);
++ }
++ 
++ /*
++  * ttyedtype --
++  * 	Reprint the characters in edq and move the cursor back to the start.
++  */
++ static void
++ ttyedtype (tp, extra)
++ 	register struct tty *tp;
++ 	int extra;
++ {
++ 	int *str;
++ 	int s, here, n, sz;
++ 
++ 	s = spltty();
++ 	here = tp->t_column;
++ 	sz = tp->t_edq.c_cc;
++ 
++ 	if (sz > 0) {
++ 		MALLOC(str, int *, sz * sizeof(int), M_TTYS, M_NOWAIT);
++ 		if (str) {
++ 			int c;
++ 			u_char *cp;
++ 
++ 			n = 0;
++ 			for (cp = firstc (&tp->t_edq, &c); cp && (n < sz); 
++ 			     cp = nextc (&tp->t_edq, cp, &c))
++ 				str[n++] = c;
++ 
++ 			for (; n > 0; n--)
++ 				ttyecho (str[n - 1], tp);
++ 
++ 			FREE (str, M_TTYS);
++ 		}
++ 	}
++ 
++ 	for (n = 0; n < extra; n++)
++ 		ttyecho (' ', tp);
++ 	if (tp->t_column > here)
++ 		ttybacko (tp, tp->t_column - here);
++ 
++ 	splx (s);
+  }
+  
+  /*
+***************
+*** 1840,1845 ****
+--- 2199,2230 ----
+  }
+  
+  /*
++  * Find the "current" process for a terminal, using the same
++  * algorithm as in ttyinfo() below.
++  */
++ static struct proc *
++ ttycurproc(tp)
++ 	register struct tty *tp;
++ {
++ 	register struct proc *p, *pick;
++ 
++ 	if (tp->t_session == NULL)
++ 		return NULL;
++ 	if (tp->t_pgrp == NULL)
++ 		return NULL;
++ 
++ 	p = tp->t_pgrp->pg_members.lh_first;
++ 	if (p == 0)
++ 		return NULL;
++ 
++ 	for (pick = NULL; p != 0; p = p->p_pglist.le_next)
++ 		if (proc_compare(pick, p))
++ 			pick = p;
++ 
++ 	return pick;
++ }
++ 
++ /*
+   * Report on state of foreground process group.
+   */
+  void
+***************
+*** 2088,2093 ****
+--- 2473,2479 ----
+  	/* XXX: default to 1024 chars for now */
+  	clalloc(&tp->t_rawq, 1024, 1);
+  	clalloc(&tp->t_canq, 1024, 1);
++ 	clalloc(&tp->t_edq, 1024, 1);
+  	/* output queue doesn't need quoting */
+  	clalloc(&tp->t_outq, 1024, 0);
+  	return(tp);
+***************
+*** 2106,2111 ****
+--- 2492,2690 ----
+  
+  	clfree(&tp->t_rawq);
+  	clfree(&tp->t_canq);
++ 	clfree(&tp->t_edq);
+  	clfree(&tp->t_outq);
+  	FREE(tp, M_TTYS);
++ }
++ 
++ /*
++  * Queue a request for the tty helper daemon.
++  */
++ 
++ static int
++ tty_help_request (tp, request, pid, include)
++ 	struct tty *tp;
++ 	pid_t pid;
++ 	int request, include;
++ {
++ 	struct tty_helper_list *thl;
++ 	int s;
++ 
++ 	/*
++ 	 * If no one is listening, stop queueing these requests
++ 	 */
++ 	if (stop_queueing_helpers)
++ 		return 0;
++ 
++ 	if (n_tty_helpers >= MAX_HELPER_REQUESTS) {
++ 		log (LOG_NOTICE, "too many tty helper requests queued");
++ 		stop_queueing_helpers = 1;
++ 		return 0;
++ 	}
++ 
++ 	MALLOC (thl, struct tty_helper_list *, sizeof (struct tty_helper_list),
++ 		M_TTYS, M_NOWAIT);
++ 	if (thl == NULL)
++ 		return 0;
++ 
++ 	thl->thl_helper.th_pid = pid;
++ 	thl->thl_helper.th_request = request;
++ 	thl->thl_helper.th_tty = tp? tp->t_dev : 0;
++ 
++ 	if (!include || !tp) {
++ 		thl->thl_helper.th_len = 0;
++ 		thl->thl_helper.th_info = NULL;
++ 	} else {
++ 		int c, len, n = 0;
++ 		u_char *cp;
++ 
++ 		s = spltty();
++ 
++ 		len = tp->t_rawq.c_cc;
++ 		thl->thl_helper.th_len = len;
++ 
++ 		MALLOC (thl->thl_helper.th_info, char *, len * sizeof (char),
++ 			M_TTYS, M_NOWAIT);
++ 
++ 		if (thl->thl_helper.th_info == NULL) {
++ 			FREE (thl, M_TTYS);
++ 			return 0;
++ 		} else {
++ 			for (cp = firstc(&tp->t_rawq, &c); cp && n < len;
++ 			     cp = nextc(&tp->t_rawq, cp, &c))
++ 				thl->thl_helper.th_info[n++] = c;
++ 		}
++ 
++ 		splx (s);
++ 	}
++ 
++ 	s = spltty();
++ 
++ 	n_tty_helpers++;
++ 	thl->thl_next = tty_helpers;
++ 	tty_helpers = thl;
++ 
++ 	splx (s);
++ 	wakeup ((caddr_t) &tty_helpers);
++ 	return 1;
++ }
++ 
++ /*
++  * tty_calc_magic - calculate hash of raw queue so we can detect changes
++  */
++ 
++ static int
++ tty_calc_magic (tp)
++ 	register struct tty *tp;
++ {
++ 	register u_char *cp;
++ 	register int magic = 0;
++ 	int s, c;
++ 
++ 	s = spltty();
++ 
++ 	for (cp = firstc(&tp->t_rawq, &c); cp; cp = nextc(&tp->t_rawq, cp, &c))
++ 		magic = magic * 3 + c;
++ 
++ 	splx (s);
++ 
++ 	if (magic == 0)
++ 		magic = 1;
++ 
++ 	return magic;
++ }
++ 
++ /*
++  * tty_emacs -- do emacs-style editing.
++  */
++ static int
++ tty_emacs (tp, c)
++ 	struct tty *tp;
++ 	int c;
++ {
++ 	struct proc *p;
++ 
++ 	if (tp->t_edflags & ES_ESC) {			/* ESC sequences */
++ 		tp->t_edflags &= ~ES_ESC;
++ 
++ 		if (c == K_ESC)				/* ESC ESC */
++ 			return 0;
++ 		else if (c == '[' || c == 'O') {	/* ESC [ */
++ 			tp->t_edflags |= ES_BRACKET;
++ 		} else if (c == 'f' || c == 'F') {	/* ESC f */
++ 			while ((c = ttyfwd (tp)) >= 0)
++ 				if (!ISSPACE (c))
++ 					break;
++ 			while ((c = ttyfwd (tp)) >= 0)
++ 				if (ISSPACE (c)) {
++ 					ttyback (tp);
++ 					break;
++ 				}
++ 		} else if (c == 'b' || c == 'B') {	/* ESC b */
++ 			while ((c = ttyback (tp)) >= 0)
++ 				if (!ISSPACE (c))
++ 					break;
++ 			while ((c = ttyback (tp)) >= 0)
++ 				if (ISSPACE (c)) {
++ 					ttyfwd (tp);
++ 					break;
++ 				}
++ 		} else 					/* ESC anything else */
++ 			ttyoutput (CTRL('g'), tp);
++ 
++ 		return 1;
++ 	} else if (tp->t_edflags & ES_BRACKET) {	/* ESC [ sequences */
++ 		tp->t_edflags &= ~ES_BRACKET;
++ 
++ 		if (c == 'A')				/* ESC [ A (up) */
++ 			c = CTRL('p');
++ 		else if (c == 'B')			/* ESC [ B (down) */
++ 			c = CTRL('n');
++ 		else if (c == 'C')			/* ESC [ C (right) */
++ 			c = CTRL('f');
++ 		else if (c == 'D')			/* ESC [ D (left) */
++ 			c = CTRL('b');
++ 		else {					/* ESC [ anything */
++ 			ttyoutput (CTRL('g'), tp);
++ 			return 1;
++ 		}
++ 	}
++ 
++ 	if (c == K_ESC)					/* ESC */
++ 		tp->t_edflags |= ES_ESC;
++ 	else if (c == CTRL('b'))			/* ^B */
++ 		ttyback (tp);
++ 	else if (c == CTRL('f'))			/* ^F */
++ 		ttyfwd (tp);
++ 	else if (c == CTRL ('a'))			/* ^A */
++ 		while (ttyback (tp) >= 0)
++ 			;
++ 	else if (c == CTRL ('e'))			/* ^E */
++ 		while (ttyfwd (tp) >= 0)
++ 			;
++ 	else if (c == CTRL ('k')) {			/* ^K */
++ 		int x, n = tp->t_edq.c_cc;
++ 
++ 		for (x = 0; x < n; x++)
++ 			ttyfwd (tp);
++ 		for (x = 0; x < n; x++)
++ 			ttyrub (unputc (&tp->t_rawq), tp, ttyrubo);
++ 	} else if (c == CTRL ('d') && tp->t_edq.c_cc > 0) {	       /* ^D */
++ 		int here;
++ 
++ 		ttyfwd (tp);
++ 		here = tp->t_column;
++ 		ttyrub(unputc(&tp->t_rawq), tp, ttyrubo);
++ 		if (tp->t_edq.c_cc > 0)
++ 			ttyedtype (tp, here - tp->t_column);
++ 	} else if (c == CTRL ('p') && ISSET(tp->t_lflag, L_HISTORY)) { /* ^P */
++ 		if ((p = ttycurproc (tp)))
++ 			tty_help_request (tp, TH_HIST_PREV, p->p_pid, FALSE);
++ 	} else if (c == CTRL ('n') && ISSET(tp->t_lflag, L_HISTORY)) { /* ^N */
++ 		if ((p = ttycurproc (tp)))
++ 			tty_help_request (tp, TH_HIST_NEXT, p->p_pid, FALSE);
++ 	} else
++ 		return 0;
++ 
++ 	return 1;
+  }
+Only in sys/kern: tty.c.works
+diff -rc ../../../src/sys/sys/termios.h sys/sys/termios.h
+*** ../../../src/sys/sys/termios.h	Tue Apr  9 15:55:41 1996
+--- sys/sys/termios.h	Wed Jun 16 20:43:51 1999
+***************
+*** 166,171 ****
+--- 166,176 ----
+  #endif  /*_POSIX_SOURCE */
+  #define	IEXTEN		0x00000400	/* enable DISCARD and LNEXT */
+  #define EXTPROC         0x00000800      /* external processing */
++ #ifndef _POSIX_SOURCE
++ #define L_SETERASE	0x00001000	/* automatically choose VERASE char */
++ #define L_EMACS		0x00002000	/* enable emacs-like editing commands */
++ #define L_HISTORY	0x00004000	/* keep history of recent input */
++ #endif  /*_POSIX_SOURCE */
+  #define TOSTOP		0x00400000	/* stop background jobs from output */
+  #ifndef _POSIX_SOURCE
+  #define FLUSHO		0x00800000	/* output being flushed (state) */
+diff -rc ../../../src/sys/sys/tty.h sys/sys/tty.h
+*** ../../../src/sys/sys/tty.h	Sun Jun  2 04:08:13 1996
+--- sys/sys/tty.h	Fri Feb 12 23:21:16 1999
+***************
+*** 89,98 ****
+--- 89,100 ----
+  	long	t_cancc;		/* Canonical queue statistics. */
+  	struct	clist t_outq;		/* Device output queue. */
+  	long	t_outcc;		/* Output queue statistics. */
++ 	struct	clist t_edq;		/* Device line editing queue. */
+  	u_char	t_line;			/* Interface to device drivers. */
+  	dev_t	t_dev;			/* Device. */
+  	int	t_state;		/* Device and driver (TS*) state. */
+  	int	t_flags;		/* Tty flags. */
++ 	int	t_edflags;		/* Tty editing flags. */
+  	struct	pgrp *t_pgrp;		/* Foreground process group. */
+  	struct	session *t_session;	/* Enclosing session. */
+  	struct	selinfo t_rsel;		/* Tty read/oob select. */
+***************
+*** 241,247 ****
+  int	 ttyoutput __P((int c, struct tty *tp));
+  void	 ttypend __P((struct tty *tp));
+  void	 ttyretype __P((struct tty *tp));
+- void	 ttyrub __P((int c, struct tty *tp));
+  int	 ttysleep __P((struct tty *tp,
+  	    void *chan, int pri, char *wmesg, int timeout));
+  int	 ttywait __P((struct tty *tp));
+--- 243,248 ----
+diff -rc ../../../src/sys/sys/ttycom.h sys/sys/ttycom.h
+*** ../../../src/sys/sys/ttycom.h	Sun May 19 12:17:53 1996
+--- sys/sys/ttycom.h	Fri Feb 12 23:27:35 1999
+***************
+*** 61,66 ****
+--- 61,94 ----
+  	unsigned short	ws_ypixel;	/* vertical size, pixels */
+  };
+  
++ /*
++  * Terminal input structure.  This allows a process to retrieve or set the
++  * line currently being edited in canonical mode.
++  */
++ 
++ struct ttyinput {
++ 	int 	ti_len;			/* buffer size or input length */
++ 	char 	*ti_text;		/* contents of the input line */
++ 	int	ti_magic;		/* magic number to detect changes */
++ };
++ 
++ /*
++  * Terminal helper structure.  This is used to communicate requests from
++  * the terminal driver to a daemon which performs tasks for it.
++  */
++ 
++ struct ttyhelper {
++ 	int 	th_request;		/* task to be performed */
++ 	dev_t	th_tty;			/* terminal making the request */
++ 	pid_t	th_pid;			/* current process for that tty */
++ 	int	th_len;			/* size of additional information */
++ 	char	*th_info;		/* buffer for additional information */
++ };
++ #define TH_HIST_PREV 1			/* retrieve previous history */
++ #define TH_HIST_NEXT 2			/* retrieve next history */
++ #define TH_HIST_KEEP 3			/* add line to history */
++ #define TH_PROC_EXIT 4			/* process has exited */
++ 
+  #define	TIOCMODG	_IOR('t', 3, int)	/* get modem control state */
+  #define	TIOCMODS	_IOW('t', 4, int)	/* set modem control state */
+  #define		TIOCM_LE	0001		/* line enable */
+***************
+*** 86,91 ****
+--- 114,123 ----
+  #define	TIOCSETAF	_IOW('t', 22, struct termios) /* drn out, fls in, set */
+  #define	TIOCGETD	_IOR('t', 26, int)	/* get line discipline */
+  #define	TIOCSETD	_IOW('t', 27, int)	/* set line discipline */
++ #define TIOCGINPUT     _IOWR('t', 28, struct ttyinput) /* get curr. input ln */
++ #define TIOCSINPUT	_IOW('t', 29, struct ttyinput) /* set curr. input ln */
++ #define TIOCTOEOL	 _IO('t', 30)		/* move cursor to end of line */
++ #define TIOCHELPER     _IOWR('t', 31, struct ttyhelper) /* volunteer to help */
+  						/* 127-124 compat */
+  #define	TIOCSBRK	 _IO('t', 123)		/* set break bit */
+  #define	TIOCCBRK	 _IO('t', 122)		/* clear break bit */
